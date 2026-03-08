@@ -1,0 +1,9 @@
+{
+  "name": "claude-autoresearch",
+  "version": "1.0.0",
+  "description": "Autonomous iterative improvement for any project — auto-detects project type, generates fitness functions, runs experiments in a keep/revert loop with git tracking.",
+  "author": {
+    "name": "NodeNestor"
+  },
+  "homepage": "https://github.com/NodeNestor/claude-autoresearch"
+}
