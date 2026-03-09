@@ -11,4 +11,4 @@ elif [ -f "$PLUGIN_ROOT/venv/Scripts/activate" ]; then
 fi
 
 # Run the hook script, passing stdin through
-python "$SCRIPT_DIR/$1" 2>/dev/null
+python3 "$SCRIPT_DIR/$1" 2>/dev/null

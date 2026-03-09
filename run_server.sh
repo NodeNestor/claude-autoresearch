@@ -8,4 +8,4 @@ elif [ -f "$SCRIPT_DIR/venv/Scripts/activate" ]; then
     source "$SCRIPT_DIR/venv/Scripts/activate"
 fi
 
-exec python "$SCRIPT_DIR/server/main.py"
+exec python3 "$SCRIPT_DIR/server/main.py"
