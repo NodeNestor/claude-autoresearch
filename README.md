@@ -25,25 +25,11 @@ init_research("./my-project")
        └── Next experiment...
 ```
 
-## Supported Project Types
+## Works With Any Project
 
-| Type | Detection | Eval Strategy |
-|------|-----------|---------------|
-| Next.js | `next.config.*` | typecheck + lint + test + build + bundle size + browser |
-| SPA (Vite/Svelte/Vue) | `vite.config.*` | lint + test + build + browser |
-| Django | `manage.py` | check + test + migrations + browser |
-| Python | `*.py` | mypy + pytest + ruff |
-| Rust | `Cargo.toml` | check + test + clippy + binary size |
-| Go | `go.mod` | build + test + vet |
-| Node.js | `package.json` | test + build + lint |
-| ML Training | `train.py` | val_loss + VRAM (with time budget) |
-| Custom | any | you provide the eval command |
+Auto-detects your project type from config files (`package.json`, `Cargo.toml`, `go.mod`, `pyproject.toml`, etc.) and generates an appropriate eval script. No configuration needed — just point it at a repo and it figures out what to test.
 
-For web apps, it can also do **browser evaluation** — start the dev server and check that pages load, no console errors, UI renders correctly.
-
-## The "Claude IS the Fitness Function" Mode
-
-For subjective improvements (code quality, readability, architecture), use the `claude_eval` tool. Claude reads the code and scores it itself — no scripts needed.
+You can also provide a custom eval command for any project type, or use the `claude_eval` tool where Claude reads the code and scores it itself — no scripts needed.
 
 ## MCP Tools
 
