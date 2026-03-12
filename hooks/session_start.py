@@ -45,15 +45,34 @@ def main():
         print(json.dumps(result))
         return
 
+    # Detect evaluator type
+    evaluator_file = os.path.join(ar_dir, "evaluator.json")
+    eval_type = "script"
+    if os.path.exists(evaluator_file):
+        try:
+            with open(evaluator_file) as f:
+                eval_type = json.load(f).get("type", "script")
+        except Exception:
+            pass
+
     # Build injection message
     exp_count = state.get("experiment_count", 0)
     best = state.get("best_score", "N/A")
     branch = state.get("branch", "unknown")
 
+    eval_hint = ""
+    if eval_type in ("agent", "hybrid"):
+        eval_hint = (
+            f"\nEvaluator: {eval_type} — when run_eval returns agent_eval_required=true, "
+            "read the rubric, evaluate, then call submit_eval_score.\n"
+        )
+
     message = (
         f"[autoresearch] ACTIVE SESSION on branch `{branch}`\n"
         f"Experiments so far: {exp_count} | Best score: {best}\n"
-        f"Description: {state.get('description', 'N/A')}\n\n"
+        f"Evaluator: {eval_type}\n"
+        f"Description: {state.get('description', 'N/A')}\n"
+        f"{eval_hint}\n"
         f"--- PROGRAM INSTRUCTIONS ---\n{program}\n--- END PROGRAM ---\n\n"
         f"Resume experimenting. Run `run_eval` to check current state, then continue the loop."
     )

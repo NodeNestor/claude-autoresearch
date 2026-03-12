@@ -11,6 +11,7 @@ import json
 from mcp_stdio import MCPServer
 from project_detector import scan_project
 from experiment import ExperimentTracker
+from evaluator import parse_evaluator_config
 
 server = MCPServer("autoresearch", "1.0.0")
 
@@ -39,62 +40,115 @@ def scan_project_tool(project_path: str, max_depth: int = 3):
 @server.tool(
     "init_research",
     "Initialize an autoresearch session. Creates a git branch, sets up tracking, "
-    "and writes the eval script YOU provide. Call scan_project first to understand "
-    "the project, then decide on an eval command and pass it here.",
+    "and configures evaluation. Call scan_project first to understand the project, "
+    "then decide on an eval strategy and pass it here.\n\n"
+    "Evaluator types:\n"
+    "- script: Shell script that outputs 'score:NUMBER' (default, fast, deterministic)\n"
+    "- agent: YOU evaluate qualitatively using a rubric (for visual/UX/subjective quality)\n"
+    "- hybrid: Script runs first as gate, then agent evaluates if script passes threshold",
     {
         "properties": {
             "project_path": {"type": "string", "description": "Absolute path to the project root"},
-            "eval_script": {"type": "string", "description": "Shell script content for evaluation. Must output 'score:NUMBER' where higher is better. You decide what commands to run based on the project."},
+            "eval_script": {"type": "string", "description": "Shell script for evaluation (shorthand for script evaluator). Must output 'score:NUMBER'."},
+            "evaluator": {
+                "type": "object",
+                "description": (
+                    "Evaluator config object. Fields depend on type:\n"
+                    "- type: 'script' | 'agent' | 'hybrid'\n"
+                    "- script: shell script content (required for script/hybrid)\n"
+                    "- rubric: markdown rubric for agent scoring (required for agent/hybrid)\n"
+                    "- method: 'code-reading' | 'vision' | 'browser' | 'api' (default: code-reading)\n"
+                    "- threshold: minimum script score to trigger agent eval (hybrid only, default: 0)\n"
+                    "- weights: {script: 0.6, agent: 0.4} for hybrid scoring"
+                ),
+            },
             "description": {"type": "string", "description": "What you want to improve"},
             "tag": {"type": "string", "description": "Optional tag for this session (default: timestamp)"},
             "program": {"type": "string", "description": "Optional custom program.md content — instructions for the research agent"},
         },
-        "required": ["project_path", "eval_script"],
+        "required": ["project_path"],
     },
 )
-def init_research(project_path: str, eval_script: str, description: str = "",
-                  tag: str = None, program: str = None):
-    """Initialize autoresearch session with agent-provided eval strategy."""
+def init_research(project_path: str, eval_script: str = None, evaluator: dict = None,
+                  description: str = "", tag: str = None, program: str = None):
+    """Initialize autoresearch session with adaptive eval strategy."""
     if not os.path.isdir(project_path):
         return json.dumps({"error": f"{project_path} is not a directory"})
+
+    # Resolve evaluator config
+    if eval_script and evaluator:
+        return json.dumps({"error": "Provide eval_script OR evaluator, not both."})
+    if not eval_script and not evaluator:
+        return json.dumps({"error": "Provide eval_script (string) or evaluator (config object)."})
+
+    try:
+        config = parse_evaluator_config(evaluator if evaluator else eval_script)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
 
     tracker = ExperimentTracker(project_path)
     state = tracker.init_session(tag=tag, description=description)
 
     ar_dir = os.path.join(project_path, ".autoresearch")
 
-    # Write the eval script provided by Claude
-    eval_path = os.path.join(ar_dir, "eval.sh")
-    with open(eval_path, "w", newline="\n") as f:
-        f.write(eval_script)
-    os.chmod(eval_path, 0o755)
+    # Save evaluator config
+    tracker.save_evaluator_config(config)
+
+    # Write eval.sh if config includes a script
+    eval_path = None
+    if config.get("script"):
+        eval_path = os.path.join(ar_dir, "eval.sh")
+        with open(eval_path, "w", newline="\n") as f:
+            f.write(config["script"])
+        os.chmod(eval_path, 0o755)
+
+    # Write rubric.md if config includes a rubric
+    if config.get("rubric"):
+        rubric_path = os.path.join(ar_dir, "rubric.md")
+        with open(rubric_path, "w") as f:
+            f.write(config["rubric"])
 
     # Write program.md
+    eval_type = config.get("type", "script")
     if program:
         program_content = program
     else:
-        program_content = DEFAULT_PROGRAM.format(description=description or "general improvement")
+        program_content = DEFAULT_PROGRAM.format(
+            description=description or "general improvement",
+            eval_type=eval_type,
+        )
 
     program_path = os.path.join(ar_dir, "program.md")
     with open(program_path, "w") as f:
         f.write(program_content)
 
-    # Run baseline eval
+    # Run baseline eval (for script/hybrid, runs immediately; for agent, returns prompt)
     baseline = tracker.run_eval()
-    if baseline.get("score") is not None:
+
+    result = {
+        "status": "initialized",
+        "branch": state["branch"],
+        "evaluator_type": eval_type,
+        "program": program_path,
+        "message": "Research session started. Read .autoresearch/program.md, then start experimenting!",
+    }
+
+    if baseline.get("agent_eval_required"):
+        # Agent/hybrid baseline — agent needs to score it
+        result["baseline_requires_agent_eval"] = True
+        result["eval_prompt"] = baseline.get("prompt", "")
+        result["message"] += " First, evaluate the baseline by reading the prompt and calling submit_eval_score."
+    elif baseline.get("score") is not None:
         tracker.log_experiment("baseline", baseline["score"], baseline.get("metrics", {}), "baseline")
         state["best_score"] = baseline["score"]
         tracker.save_state(state)
+        result["baseline_score"] = baseline["score"]
+        result["baseline_output"] = baseline.get("output", "")[-500:]
 
-    return json.dumps({
-        "status": "initialized",
-        "branch": state["branch"],
-        "baseline_score": baseline.get("score"),
-        "baseline_output": baseline.get("output", "")[-500:],
-        "eval_script": eval_path,
-        "program": program_path,
-        "message": "Research session started. Read .autoresearch/program.md, then start experimenting!",
-    }, indent=2)
+    if eval_path:
+        result["eval_script"] = eval_path
+
+    return json.dumps(result, indent=2)
 
 
 @server.tool(
@@ -110,6 +164,28 @@ def init_research(project_path: str, eval_script: str, description: str = "",
 def run_eval(project_path: str):
     tracker = ExperimentTracker(project_path)
     result = tracker.run_eval()
+    return json.dumps(result, indent=2)
+
+
+@server.tool(
+    "submit_eval_score",
+    "Submit your evaluation score after an agent or hybrid eval. "
+    "Call this after run_eval returns agent_eval_required=true. "
+    "Read the rubric, evaluate honestly, then submit your score here.",
+    {
+        "properties": {
+            "project_path": {"type": "string", "description": "Project root path"},
+            "score": {"type": "number", "description": "Your score based on the rubric (0-100)"},
+            "metrics": {"type": "object", "description": "Optional metrics from your evaluation (e.g., {correctness: 20, design: 15})"},
+            "assessment": {"type": "string", "description": "Brief qualitative assessment (1-3 sentences)"},
+        },
+        "required": ["project_path", "score"],
+    },
+)
+def submit_eval_score(project_path: str, score: float, metrics: dict = None,
+                      assessment: str = None):
+    tracker = ExperimentTracker(project_path)
+    result = tracker.submit_eval_score(score, metrics, assessment)
     return json.dumps(result, indent=2)
 
 
@@ -220,6 +296,7 @@ DEFAULT_PROGRAM = """# Autoresearch Program
 
 You are an autonomous research agent improving this project.
 Goal: {description}
+Evaluator: {eval_type}
 
 ## Rules
 
@@ -228,7 +305,24 @@ Goal: {description}
 3. **Always run eval.** After every change, use `run_eval` and check the score.
 4. **Keep or revert.** Score improves → `keep_changes`. Score drops → `revert_changes`.
 5. **Log everything.** After each experiment, use `log_experiment`.
-6. **Stay in scope.** Don't modify eval.sh or program.md.
+6. **Stay in scope.** Don't modify eval.sh, rubric.md, or program.md.
+
+## Evaluation Flow
+
+### If evaluator is `script`:
+- `run_eval` returns a score directly. Use it for keep/revert.
+
+### If evaluator is `agent`:
+- `run_eval` returns `agent_eval_required: true` with a rubric and context.
+- Read the rubric carefully.
+- Evaluate the current state **honestly** — score inflation defeats the purpose.
+- Call `submit_eval_score` with your score (0-100), optional metrics, and assessment.
+- Use the returned score for keep/revert.
+
+### If evaluator is `hybrid`:
+- `run_eval` runs the script first. If below threshold, returns score directly (skip agent).
+- If above threshold, returns `agent_eval_required: true` — same as agent flow.
+- The final score is a weighted combination of script and agent scores.
 
 ## What to Try
 
@@ -244,7 +338,7 @@ Goal: {description}
 
 1. Describe what you're going to try (1 sentence)
 2. Make the change
-3. Run eval
+3. Run eval (and submit_eval_score if agent eval required)
 4. Decide: KEEP or REVERT
 5. Log the result
 6. Move to next experiment immediately

@@ -7,6 +7,14 @@ import time
 import re
 from datetime import datetime, timezone
 
+from evaluator import (
+    parse_evaluator_config,
+    ScriptEvaluator,
+    AgentEvaluator,
+    HybridEvaluator,
+    compute_hybrid_score,
+)
+
 
 class ExperimentTracker:
     def __init__(self, project_path: str):
@@ -14,6 +22,7 @@ class ExperimentTracker:
         self.ar_dir = os.path.join(project_path, ".autoresearch")
         self.results_file = os.path.join(self.ar_dir, "results.tsv")
         self.state_file = os.path.join(self.ar_dir, "state.json")
+        self.evaluator_file = os.path.join(self.ar_dir, "evaluator.json")
 
     def _run_git(self, *args) -> tuple[int, str]:
         """Run git command in project dir."""
@@ -92,49 +101,87 @@ class ExperimentTracker:
         with open(self.state_file, "w") as f:
             json.dump(state, f, indent=2)
 
+    def load_evaluator_config(self) -> dict:
+        """Load evaluator config. Falls back to script type if only eval.sh exists."""
+        if os.path.exists(self.evaluator_file):
+            with open(self.evaluator_file) as f:
+                return json.load(f)
+        # Backwards compat: old sessions only have eval.sh
+        if os.path.exists(os.path.join(self.ar_dir, "eval.sh")):
+            return {"type": "script"}
+        return {"type": "script"}
+
+    def save_evaluator_config(self, config: dict):
+        """Save evaluator config."""
+        with open(self.evaluator_file, "w") as f:
+            json.dump(config, f, indent=2)
+
     def run_eval(self) -> dict:
-        """Run the eval script and parse results."""
-        eval_script = os.path.join(self.ar_dir, "eval.sh")
-        if not os.path.exists(eval_script):
-            return {"error": "No eval.sh found. Run init_session first."}
+        """Run evaluation using the configured strategy."""
+        config = self.load_evaluator_config()
+        eval_type = config.get("type", "script")
 
-        start = time.time()
-        try:
-            result = subprocess.run(
-                ["bash", eval_script],
-                cwd=self.project_path,
-                capture_output=True,
-                text=True,
-                timeout=600,  # 10 min max
-            )
-            elapsed = time.time() - start
-        except subprocess.TimeoutExpired:
-            return {"error": "Eval timed out (600s)", "score": 0, "elapsed": 600}
+        if eval_type == "script":
+            return ScriptEvaluator(self.project_path, self.ar_dir).run()
+        elif eval_type == "agent":
+            return AgentEvaluator(self.project_path, config).prepare()
+        elif eval_type == "hybrid":
+            def save_pending_script_score(score):
+                state = self.load_state()
+                if state:
+                    state["pending_script_score"] = score
+                    self.save_state(state)
+            return HybridEvaluator(
+                self.project_path, self.ar_dir, config,
+                save_state_fn=save_pending_script_score,
+            ).run()
+        else:
+            return {"error": f"Unknown evaluator type: {eval_type}"}
 
-        output = result.stdout + "\n" + result.stderr
+    def submit_eval_score(self, score: float, metrics: dict = None,
+                          assessment: str = None) -> dict:
+        """Submit an agent-provided score. Handles hybrid weighting if applicable."""
+        config = self.load_evaluator_config()
+        state = self.load_state()
+        final_metrics = metrics or {}
 
-        # Parse score
-        score_match = re.search(r"score:([0-9.]+)", output)
-        score = float(score_match.group(1)) if score_match else None
+        if assessment:
+            final_metrics["agent_assessment"] = assessment
 
-        # Parse metrics
-        metrics = {}
-        for m in re.finditer(r"metric:(\w+)=([0-9.]+)", output):
-            metrics[m.group(1)] = float(m.group(2))
-
-        # Parse total
-        total_match = re.search(r"total:([0-9.]+)/([0-9.]+)", output)
-        if total_match:
-            metrics["passed"] = float(total_match.group(1))
-            metrics["total"] = float(total_match.group(2))
-
-        return {
-            "score": score,
-            "metrics": metrics,
-            "exit_code": result.returncode,
-            "elapsed": round(elapsed, 1),
-            "output": output[-2000:],  # last 2000 chars
-        }
+        if config.get("type") == "hybrid":
+            # Load pending script score from state
+            script_score = state.get("pending_script_score")
+            if script_score is not None:
+                weights = config.get("weights", {"script": 0.6, "agent": 0.4})
+                final_score = compute_hybrid_score(script_score, score, weights)
+                final_metrics["script_score"] = script_score
+                final_metrics["agent_score"] = score
+                final_metrics["weights"] = weights
+                # Clear pending
+                state.pop("pending_script_score", None)
+                self.save_state(state)
+                return {
+                    "score": final_score,
+                    "script_score": script_score,
+                    "agent_score": score,
+                    "metrics": final_metrics,
+                    "strategy": "hybrid",
+                }
+            else:
+                # No pending script score — just use agent score
+                return {
+                    "score": score,
+                    "metrics": final_metrics,
+                    "strategy": "hybrid",
+                    "warning": "No pending script score found, using agent score only.",
+                }
+        else:
+            # Pure agent eval
+            return {
+                "score": score,
+                "metrics": final_metrics,
+                "strategy": "agent",
+            }
 
     def log_experiment(self, description: str, score: float, metrics: dict,
                        status: str = "keep") -> dict:
